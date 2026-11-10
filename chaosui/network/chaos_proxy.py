@@ -37,14 +37,21 @@ class NetworkChaosInjector:
 
         await page.route("**/*", self._intercept_route)
 
+    async def detach(self, page: Page) -> None:
+        if not self.enabled:
+            return
+        try:
+            await page.unroute("**/*", self._intercept_route)
+        except Exception:
+            pass
+
     async def _intercept_route(self, route: Route, request: Request) -> None:
-        # Don't disrupt essential static scripts or html needed for the page itself
         url = request.url
         resource_type = request.resource_type
 
         # Focus chaos on API / fetch / xhr requests
         if resource_type in ("fetch", "xhr") or "/api/" in url:
-            # 1. Random failure injection (e.g. 500 or abort)
+            # 1. Random failure injection (transient network abort)
             if random.random() < self.failure_prob:
                 if self.session:
                     self.session.record_action(
@@ -53,9 +60,9 @@ class NetworkChaosInjector:
                     )
                 try:
                     await route.abort("failed")
-                    return
                 except Exception:
                     pass
+                return
 
             # 2. Random latency injection (simulates sluggish mobile network or server load)
             if random.random() < self.latency_prob:

@@ -71,7 +71,7 @@ chaosui-engine/
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-org/chaosui-engine.git
+git clone https://github.com/Aziz582/chaosui-engine.git
 cd chaosui-engine
 
 # Create and activate virtual environment
@@ -117,6 +117,8 @@ chaosui run https://staging.myapp.com --fail-on-critical
 | `--duration, -d` | `30` | أقصى مدة بالثواني لاختبار الفوضى |
 | `--actions, -a` | `35` | الحد الأقصى للإجراءات التفاعلية |
 | `--intensity, -i` | `high` | شدة الفوضى (`low`, `medium`, `high`, `insane`) |
+| `--persona, -P` | `all` | تحديد شخصيات معينة (مثل `--persona rage_clicker`) |
+| `--browser, -b` | `chromium` | محرك المتصفح (`chromium`, `firefox`, `webkit`) |
 | `--freeze-threshold` | `350` | عتبة تجمد الشاشة بالمللي ثانية (ms) |
 | `--duplicate-window` | `2500` | النافذة الزمنية لاكتشاف تكرار الطلبات (ms) |
 | `--headless / --no-headless` | `True` | تشغيل المتصفح في الخلفية أو بوضع مرئي |

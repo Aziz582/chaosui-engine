@@ -4,33 +4,50 @@ Intercepts network requests to detect when multiple identical mutations are trig
 """
 
 from __future__ import annotations
+from collections import deque
 import hashlib
 import time
-from typing import List, Dict, Any, Optional
+from typing import Deque, List, Dict, Any
 from playwright.async_api import Page, BrowserContext, Request
 from chaosui.detectors.base import BaseDetector
-from chaosui.core.models import FaultRecord, FaultType, Severity, ActionRecord
+from chaosui.core.models import FaultRecord, FaultType, Severity
 from chaosui.core.session import ChaosSession
 
 
 class DuplicateRequestDetector(BaseDetector):
     """Detects multiple identical or concurrent state-mutating requests (POST, PUT, PATCH, DELETE)."""
 
-    def __init__(self, window_ms: int = 2500):
+    def __init__(self, window_ms: int = 2500, max_history: int = 500):
         super().__init__("duplicate_request_detector")
         self.window_ms = window_ms
-        self.request_history: List[Dict[str, Any]] = []
+        self.request_history: Deque[Dict[str, Any]] = deque(maxlen=max_history)
         self.reported_keys: set[str] = set()
-        self.last_action: Optional[ActionRecord] = None
 
     async def attach(self, page: Page, context: BrowserContext, session: ChaosSession) -> None:
         await super().attach(page, context, session)
-
-        # Hook into page requests
         page.on("request", self._handle_request)
 
-    async def on_action_start(self, action: ActionRecord) -> None:
-        self.last_action = action
+    async def detach(self) -> None:
+        if self.page:
+            try:
+                self.page.remove_listener("request", self._handle_request)
+            except Exception:
+                pass
+        await super().detach()
+
+    def _extract_payload_info(self, request: Request) -> tuple[str, str]:
+        """Safely extracts a preview string and hash even for binary payloads."""
+        try:
+            post_data = request.post_data or ""
+            post_hash = hashlib.sha256(post_data.encode("utf-8", errors="replace")).hexdigest()[:12] if post_data else "EMPTY"
+            return post_data[:200], post_hash
+        except Exception:
+            try:
+                buf = request.post_data_buffer or b""
+                post_hash = hashlib.sha256(buf).hexdigest()[:12] if buf else "EMPTY"
+                return f"<binary {len(buf)} bytes>", post_hash
+            except Exception:
+                return "", "EMPTY"
 
     def _handle_request(self, request: Request) -> None:
         method = request.method.upper()
@@ -39,18 +56,17 @@ class DuplicateRequestDetector(BaseDetector):
             return
 
         url = request.url
-        post_data = request.post_data or ""
-        post_hash = hashlib.sha256(post_data.encode("utf-8")).hexdigest()[:12] if post_data else "EMPTY"
+        preview, post_hash = self._extract_payload_info(request)
         req_time = time.time()
 
         self.request_history.append(
             {
                 "method": method,
                 "url": url,
-                "post_data": post_data[:200],  # truncated snippet
+                "post_data": preview,
                 "post_hash": post_hash,
                 "timestamp": req_time,
-                "action": self.last_action.description if self.last_action else "Unknown action",
+                "action": self.current_action_description,
             }
         )
 
@@ -62,75 +78,94 @@ class DuplicateRequestDetector(BaseDetector):
             return []
 
         now = time.time()
-        window_seconds = self.window_ms / 1000.0
         faults: List[FaultRecord] = []
 
-        # Prune very old history
-        self.request_history = [r for r in self.request_history if now - r["timestamp"] <= 30.0]
+        # Prune stale entries older than 30s from the left of the deque
+        while self.request_history and (now - self.request_history[0]["timestamp"]) > 30.0:
+            self.request_history.popleft()
 
         # Group requests by (method, url, post_hash)
         grouped: Dict[str, List[Dict[str, Any]]] = {}
-        for req in self.request_history:
+        for req in list(self.request_history):
             key = f"{req['method']}:{req['url']}:{req['post_hash']}"
-            if key not in grouped:
-                grouped[key] = []
-            grouped[key].append(req)
+            grouped.setdefault(key, []).append(req)
 
-        # Check for groups with multiple occurrences within window_seconds
+        # Check for groups with multiple occurrences within window_ms
         for key, reqs in grouped.items():
             if len(reqs) < 2:
                 continue
 
-            # Sort by timestamp
             reqs.sort(key=lambda x: x["timestamp"])
 
-            # Check consecutive requests
-            for i in range(len(reqs) - 1):
-                first = reqs[i]
-                second = reqs[i + 1]
-                delta_ms = round((second["timestamp"] - first["timestamp"]) * 1000, 1)
+            # Cluster requests whose consecutive gaps fall within window_ms
+            cluster: List[Dict[str, Any]] = [reqs[0]]
+            for req in reqs[1:]:
+                gap_ms = round((req["timestamp"] - cluster[-1]["timestamp"]) * 1000, 1)
+                if gap_ms <= self.window_ms:
+                    cluster.append(req)
+                else:
+                    if len(cluster) >= 2:
+                        self._maybe_report_cluster(key, cluster, faults)
+                    cluster = [req]
 
-                if delta_ms <= self.window_ms:
-                    incident_id = f"{key}:{round(first['timestamp'], 2)}"
-                    if incident_id in self.reported_keys:
-                        continue
-
-                    self.reported_keys.add(incident_id)
-
-                    method = first["method"]
-                    url = first["url"]
-                    url_lower = url.lower()
-
-                    # Determine severity based on criticality of endpoint
-                    critical_keywords = ("pay", "checkout", "order", "charge", "transfer", "subscribe", "buy", "cart")
-                    if any(kw in url_lower for kw in critical_keywords):
-                        severity = Severity.CRITICAL
-                        title = f"CRITICAL: Duplicate Transactional Request to {url}"
-                    else:
-                        severity = Severity.HIGH
-                        title = f"Duplicate {method} Request Detected ({delta_ms}ms gap)"
-
-                    desc = (
-                        f"Detected {len(reqs)} duplicate {method} requests dispatched within {delta_ms}ms "
-                        f"to '{url}' without debounce or form disabling. "
-                        f"Triggered after: '{second.get('action')}'."
-                    )
-
-                    fault = self.session.record_fault(
-                        fault_type=FaultType.DUPLICATE_REQUEST,
-                        severity=severity,
-                        title=title,
-                        description=desc,
-                        evidence={
-                            "method": method,
-                            "url": url,
-                            "gap_ms": delta_ms,
-                            "window_ms": self.window_ms,
-                            "duplicate_count": len(reqs),
-                            "payload_preview": first.get("post_data"),
-                            "correlated_action": second.get("action"),
-                        },
-                    )
-                    faults.append(fault)
+            if len(cluster) >= 2:
+                self._maybe_report_cluster(key, cluster, faults)
 
         return faults
+
+    def _maybe_report_cluster(
+        self,
+        key: str,
+        cluster: List[Dict[str, Any]],
+        faults: List[FaultRecord],
+    ) -> None:
+        if not self.session:
+            return
+
+        first = cluster[0]
+        second = cluster[1]
+        last = cluster[-1]
+        delta_ms = round((second["timestamp"] - first["timestamp"]) * 1000, 1)
+
+        # Deduplicate per burst based on the first request timestamp in the cluster
+        incident_id = f"{key}:{round(first['timestamp'], 2)}:{len(cluster)}"
+        base_id = f"{key}:{round(first['timestamp'], 2)}"
+        if base_id in self.reported_keys:
+            return
+        self.reported_keys.add(base_id)
+        self.reported_keys.add(incident_id)
+
+        method = first["method"]
+        url = first["url"]
+        url_lower = url.lower()
+
+        critical_keywords = ("pay", "checkout", "order", "charge", "transfer", "subscribe", "buy", "cart")
+        if any(kw in url_lower for kw in critical_keywords):
+            severity = Severity.CRITICAL
+            title = f"CRITICAL: Duplicate Transactional Request to {url}"
+        else:
+            severity = Severity.HIGH
+            title = f"Duplicate {method} Request Detected ({delta_ms}ms gap)"
+
+        desc = (
+            f"Detected {len(cluster)} duplicate {method} requests dispatched within {delta_ms}ms "
+            f"to '{url}' without debounce or form disabling. "
+            f"Triggered after: '{last.get('action')}'."
+        )
+
+        fault = self.session.record_fault(
+            fault_type=FaultType.DUPLICATE_REQUEST,
+            severity=severity,
+            title=title,
+            description=desc,
+            evidence={
+                "method": method,
+                "url": url,
+                "gap_ms": delta_ms,
+                "window_ms": self.window_ms,
+                "duplicate_count": len(cluster),
+                "payload_preview": first.get("post_data"),
+                "correlated_action": last.get("action"),
+            },
+        )
+        faults.append(fault)

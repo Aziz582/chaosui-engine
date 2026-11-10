@@ -18,6 +18,16 @@ class BaseDetector(ABC):
         self.session: Optional[ChaosSession] = None
         self.page: Optional[Page] = None
         self.context: Optional[BrowserContext] = None
+        self.last_action: Optional[ActionRecord] = None
+
+    @property
+    def current_action_description(self) -> str:
+        """Returns the most recent recorded session action description."""
+        if self.session and self.session.actions:
+            return self.session.actions[-1].description
+        if self.last_action:
+            return self.last_action.description
+        return "Initial page interaction"
 
     @abstractmethod
     async def attach(self, page: Page, context: BrowserContext, session: ChaosSession) -> None:
@@ -32,12 +42,12 @@ class BaseDetector(ABC):
         pass
 
     async def on_action_start(self, action: ActionRecord) -> None:
-        """Invoked immediately before an action is executed."""
-        pass
+        """Invoked when an action is initiated."""
+        self.last_action = action
 
     async def on_action_end(self, action: ActionRecord) -> None:
-        """Invoked immediately after an action is executed."""
-        pass
+        """Invoked immediately after an action finishes."""
+        self.last_action = action
 
     async def detach(self) -> None:
         """Clean up detector listeners or scripts."""

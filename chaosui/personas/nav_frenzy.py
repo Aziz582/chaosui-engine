@@ -55,7 +55,6 @@ class NavFrenzy(BasePersona):
                 description="Toggled URL hash anchor rapidly",
             )
             try:
-                curr = page.url
                 await page.evaluate("window.location.hash = '#chaos-' + Date.now();")
                 await asyncio.sleep(0.05)
                 await page.evaluate("window.location.hash = '';")

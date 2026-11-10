@@ -15,7 +15,7 @@ from chaosui.core.models import (
 from chaosui.core.engine import ChaosEngine
 from chaosui.core.session import ChaosSession
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "ChaosEngine",

@@ -5,11 +5,12 @@ Manages browser lifecycle, runs chaos test loop, coordinates personas and detect
 
 from __future__ import annotations
 import asyncio
+import logging
 import os
 import time
 from typing import List, Optional, Callable
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
-from chaosui.core.models import ChaosConfig, ChaosReport, FaultRecord
+from chaosui.core.models import ChaosConfig, ChaosReport, FaultRecord, FaultType, Severity
 from chaosui.core.session import ChaosSession
 from chaosui.core.target_finder import TargetFinder
 from chaosui.detectors.base import BaseDetector
@@ -21,6 +22,8 @@ from chaosui.network.chaos_proxy import NetworkChaosInjector
 from chaosui.personas.base import BasePersona
 from chaosui.personas.chaos_monkey import ImpulsiveUserPersona
 
+logger = logging.getLogger(__name__)
+
 
 class ChaosEngine:
     """The central orchestrator of ChaosUI execution."""
@@ -29,7 +32,7 @@ class ChaosEngine:
         self.config = config
         self.session = ChaosSession(target_url=config.target_url)
         self.detectors: List[BaseDetector] = []
-        self.persona: BasePersona = ImpulsiveUserPersona()
+        self.persona: BasePersona = ImpulsiveUserPersona(allowed_personas=config.personas)
         self.network_chaos = NetworkChaosInjector(enabled=config.network_chaos)
         self.progress_callback: Optional[Callable[[int, int, str], None]] = None
 
@@ -46,6 +49,19 @@ class ChaosEngine:
             StuckStateDetector(),
         ]
 
+    async def _capture_fault_screenshot(self, page: Page, fault: FaultRecord) -> None:
+        if not self.config.screenshot_on_fault or fault.screenshot_path:
+            return
+        try:
+            screenshot_file = os.path.join(
+                self.screenshots_dir,
+                f"fault_{fault.fault_type.value}_{int(fault.timestamp * 1000)}.png",
+            )
+            await page.screenshot(path=screenshot_file, full_page=False)
+            fault.screenshot_path = screenshot_file
+        except Exception as exc:
+            logger.debug("Could not capture screenshot for fault '%s': %s", fault.title, exc)
+
     async def run(self) -> ChaosReport:
         """Executes the chaos testing session and returns the completed ChaosReport."""
         self._init_detectors()
@@ -56,94 +72,112 @@ class ChaosEngine:
                 headless=self.config.headless,
                 args=["--disable-web-security", "--allow-running-insecure-content"],
             )
+            context: Optional[BrowserContext] = None
+            page: Optional[Page] = None
 
-            context: BrowserContext = await browser.new_context(
-                viewport={"width": 1280, "height": 800},
-                user_agent="Mozilla/5.0 (ChaosUI-Engine/1.0 ImpatientCustomerBot)",
-            )
-
-            page: Page = await context.new_page()
-
-            # Attach network chaos
-            await self.network_chaos.attach(page, self.session)
-
-            # Attach all detectors
-            for detector in self.detectors:
-                await detector.attach(page, context, self.session)
-
-            # Navigate to target
             try:
-                await page.goto(self.config.target_url, wait_until="domcontentloaded", timeout=15000)
-            except Exception as e:
-                # If initial navigation fails, still check for fatal crashes
-                self.session.record_fault(
-                    fault_type=self.detectors[2].session.faults[0].fault_type if self.detectors else None,  # type: ignore
-                    severity=self.detectors[2].session.faults[0].severity if self.detectors else None,  # type: ignore
-                    title=f"Navigation Error to {self.config.target_url}",
-                    description=str(e),
+                context = await browser.new_context(
+                    viewport={"width": 1280, "height": 800},
+                    user_agent="Mozilla/5.0 (ChaosUI-Engine/1.0 ImpatientCustomerBot)",
                 )
 
-            # Main Chaos Loop
-            action_count = 0
-            start_time = time.time()
+                page = await context.new_page()
 
-            # Determine loop delay based on intensity
-            delay_map = {"low": 0.5, "medium": 0.25, "high": 0.1, "insane": 0.02}
-            tick_delay = delay_map.get(self.config.intensity.lower(), 0.1)
+                # Attach network chaos
+                await self.network_chaos.attach(page, self.session)
 
-            while (
-                action_count < self.config.max_actions
-                and (time.time() - start_time) < self.config.max_duration_seconds
-            ):
-                action_count += 1
+                # Attach all detectors
+                for detector in self.detectors:
+                    await detector.attach(page, context, self.session)
 
-                # 1. Scan for actionable targets
-                targets = await TargetFinder.scan_page(page)
-
-                # 2. Inform detectors of action start
-                for d in self.detectors:
-                    if self.session.actions:
-                        await d.on_action_start(self.session.actions[-1])
-
-                # 3. Persona executes an action turn
+                # Navigate to target
+                nav_ok = True
                 try:
-                    acted = await self.persona.act(page, self.session, targets)
-                except Exception:
-                    acted = False
+                    await page.goto(self.config.target_url, wait_until="domcontentloaded", timeout=15000)
+                except Exception as exc:
+                    nav_ok = False
+                    nav_fault = self.session.record_fault(
+                        fault_type=FaultType.CRASH,
+                        severity=Severity.CRITICAL,
+                        title=f"Navigation Error to {self.config.target_url}",
+                        description=f"Failed to load target URL '{self.config.target_url}': {exc}",
+                        evidence={"target_url": self.config.target_url, "error": str(exc)},
+                    )
+                    await self._capture_fault_screenshot(page, nav_fault)
 
-                if self.progress_callback and self.session.actions:
-                    last_act = self.session.actions[-1]
-                    self.progress_callback(action_count, self.config.max_actions, last_act.description)
+                if nav_ok:
+                    action_count = 0
+                    start_time = time.time()
 
-                # 4. Check detectors for newly triggered faults
-                for d in self.detectors:
-                    new_faults: List[FaultRecord] = await d.check()
-                    for fault in new_faults:
-                        if self.config.screenshot_on_fault and not fault.screenshot_path:
-                            try:
-                                screenshot_file = os.path.join(
-                                    self.screenshots_dir,
-                                    f"fault_{fault.fault_type.value}_{int(fault.timestamp * 1000)}.png",
+                    delay_map = {"low": 0.5, "medium": 0.25, "high": 0.1, "insane": 0.02}
+                    tick_delay = delay_map.get(self.config.intensity.lower(), 0.1)
+
+                    while (
+                        action_count < self.config.max_actions
+                        and (time.time() - start_time) < self.config.max_duration_seconds
+                    ):
+                        action_count += 1
+                        prev_actions_len = len(self.session.actions)
+
+                        # 1. Scan for actionable targets
+                        targets = await TargetFinder.scan_page(page)
+
+                        # 2. Persona executes an action turn
+                        try:
+                            await self.persona.act(page, self.session, targets)
+                        except Exception as exc:
+                            logger.debug("Persona turn encountered error: %s", exc)
+
+                        # 3. Notify detectors & progress callback of newly executed action
+                        if len(self.session.actions) > prev_actions_len:
+                            latest_action = self.session.actions[-1]
+                            for d in self.detectors:
+                                await d.on_action_end(latest_action)
+                            if self.progress_callback:
+                                self.progress_callback(
+                                    action_count, self.config.max_actions, latest_action.description
                                 )
-                                await page.screenshot(path=screenshot_file, full_page=False)
-                                fault.screenshot_path = screenshot_file
-                            except Exception:
-                                pass
+                        elif self.progress_callback:
+                            self.progress_callback(action_count, self.config.max_actions, "Scanning page state...")
 
-                await asyncio.sleep(tick_delay)
+                        # 4. Check detectors for newly triggered faults
+                        for d in self.detectors:
+                            new_faults: List[FaultRecord] = await d.check()
+                            for fault in new_faults:
+                                await self._capture_fault_screenshot(page, fault)
 
-            # Final check before teardown
-            await asyncio.sleep(0.5)
-            for d in self.detectors:
-                await d.check()
+                        await asyncio.sleep(tick_delay)
 
-            # Close browser
-            await context.close()
-            await browser.close()
+                    # Final settle check before teardown
+                    await asyncio.sleep(0.5)
+                    for d in self.detectors:
+                        final_faults = await d.check()
+                        for fault in final_faults:
+                            await self._capture_fault_screenshot(page, fault)
+            finally:
+                for d in self.detectors:
+                    try:
+                        await d.detach()
+                    except Exception:
+                        pass
+                if page is not None:
+                    try:
+                        await self.network_chaos.detach(page)
+                    except Exception:
+                        pass
+                if context is not None:
+                    try:
+                        await context.close()
+                    except Exception:
+                        pass
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
 
         self.session.close()
 
-        report = ChaosReport(
+        return ChaosReport(
             session_id=self.session.session_id,
             target_url=self.config.target_url,
             start_time=self.session.start_time_iso,
@@ -153,5 +187,3 @@ class ChaosEngine:
             action_history=self.session.actions,
             metrics=self.session.metrics,
         )
-
-        return report

@@ -7,7 +7,7 @@ import time
 from typing import List, Dict, Any, Optional
 from playwright.async_api import Page, BrowserContext, Error as PlaywrightError, ConsoleMessage, Response
 from chaosui.detectors.base import BaseDetector
-from chaosui.core.models import FaultRecord, FaultType, Severity, ActionRecord
+from chaosui.core.models import FaultRecord, FaultType, Severity
 from chaosui.core.session import ChaosSession
 
 
@@ -19,7 +19,6 @@ class CrashDetector(BaseDetector):
         self.errors: List[Dict[str, Any]] = []
         self.server_errors: List[Dict[str, Any]] = []
         self.reported_errors: set[str] = set()
-        self.last_action: Optional[ActionRecord] = None
 
     async def attach(self, page: Page, context: BrowserContext, session: ChaosSession) -> None:
         await super().attach(page, context, session)
@@ -29,8 +28,19 @@ class CrashDetector(BaseDetector):
         page.on("crash", self._handle_page_crash)
         page.on("response", self._handle_response)
 
-    async def on_action_start(self, action: ActionRecord) -> None:
-        self.last_action = action
+    async def detach(self) -> None:
+        if self.page:
+            for event, handler in (
+                ("pageerror", self._handle_page_error),
+                ("console", self._handle_console),
+                ("crash", self._handle_page_crash),
+                ("response", self._handle_response),
+            ):
+                try:
+                    self.page.remove_listener(event, handler)
+                except Exception:
+                    pass
+        await super().detach()
 
     def _handle_page_error(self, error: PlaywrightError) -> None:
         self.errors.append(
@@ -38,30 +48,29 @@ class CrashDetector(BaseDetector):
                 "type": "uncaught_exception",
                 "message": str(error),
                 "timestamp": time.time(),
-                "action": self.last_action.description if self.last_action else "User action",
+                "action": self.current_action_description,
             }
         )
 
     def _handle_console(self, msg: ConsoleMessage) -> None:
         if msg.type == "error":
-            # Ignore standard benign network 404s in console if they clutter
             text = msg.text
             self.errors.append(
                 {
                     "type": "console_error",
                     "message": text[:300],
                     "timestamp": time.time(),
-                    "action": self.last_action.description if self.last_action else "User action",
+                    "action": self.current_action_description,
                 }
             )
 
-    def _handle_page_crash(self) -> None:
+    def _handle_page_crash(self, _page: Optional[Page] = None) -> None:
         self.errors.append(
             {
                 "type": "page_crash",
                 "message": "Browser page/renderer process crashed completely!",
                 "timestamp": time.time(),
-                "action": self.last_action.description if self.last_action else "User action",
+                "action": self.current_action_description,
             }
         )
 
@@ -72,7 +81,7 @@ class CrashDetector(BaseDetector):
                     "status": response.status,
                     "url": response.url,
                     "timestamp": time.time(),
-                    "action": self.last_action.description if self.last_action else "User action",
+                    "action": self.current_action_description,
                 }
             )
             if self.session:
@@ -95,13 +104,17 @@ class CrashDetector(BaseDetector):
                 }"""
             )
             if is_blank:
-                action_desc = self.last_action.description if self.last_action else "Action"
+                ws_key = f"white_screen:{self.page.url}"
+                if ws_key in self.reported_errors:
+                    return None
+                self.reported_errors.add(ws_key)
+                action_desc = self.current_action_description
                 return self.session.record_fault(
                     fault_type=FaultType.CRASH,
                     severity=Severity.CRITICAL,
                     title="White Screen of Death (Empty DOM Root)",
                     description=f"The application DOM was wiped out or rendered empty after: '{action_desc}'.",
-                    evidence={"blank_detected": True, "correlated_action": action_desc},
+                    evidence={"blank_detected": True, "url": self.page.url, "correlated_action": action_desc},
                 )
         except Exception:
             pass
@@ -113,8 +126,15 @@ class CrashDetector(BaseDetector):
 
         faults: List[FaultRecord] = []
 
+        # Atomically drain buffered errors to prevent unbounded memory growth
+        pending_errors = self.errors[:]
+        self.errors.clear()
+
+        pending_server_errors = self.server_errors[:]
+        self.server_errors.clear()
+
         # 1. Uncaught JS & Console Errors
-        for err in self.errors:
+        for err in pending_errors:
             msg = err["message"]
             err_key = f"{err['type']}:{msg[:80]}"
             if err_key in self.reported_errors:
@@ -145,7 +165,7 @@ class CrashDetector(BaseDetector):
             faults.append(fault)
 
         # 2. Server 5xx directly provoked by client UI actions
-        for srv in self.server_errors:
+        for srv in pending_server_errors:
             srv_key = f"{srv['status']}:{srv['url']}"
             if srv_key in self.reported_errors:
                 continue

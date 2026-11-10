@@ -4,9 +4,12 @@ Discovers interactive elements and classifies them by operational risk.
 """
 
 from __future__ import annotations
-from typing import List, Optional
+import logging
+from typing import List
 from playwright.async_api import Page
 from chaosui.core.models import TargetInfo
+
+logger = logging.getLogger(__name__)
 
 # JS snippet executed in page to extract interactive DOM elements
 DOM_SCAN_SCRIPT = """
@@ -19,19 +22,43 @@ DOM_SCAN_SCRIPT = """
         return rect.width > 0 && rect.height > 0 && rect.top < window.innerHeight * 2 && rect.bottom > -window.innerHeight;
     };
 
+    const escapeIdent = (val) => {
+        if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
+            return CSS.escape(val);
+        }
+        return val.replace(/([!"#$%&'()*+,./:;<=>?@[\\]^`{|}~])/g, '\\\\$1');
+    };
+
     const getSelector = (el) => {
-        if (el.id) return `#${el.id}`;
-        if (el.getAttribute('data-testid')) return `[data-testid="${el.getAttribute('data-testid')}"]`;
-        if (el.name) return `${el.tagName.toLowerCase()}[name="${el.name}"]`;
-        
+        if (el.id) return `#${escapeIdent(el.id)}`;
+        const testId = el.getAttribute('data-testid');
+        if (testId) return `[data-testid=${JSON.stringify(testId)}]`;
+        if (el.name) return `${el.tagName.toLowerCase()}[name=${JSON.stringify(el.name)}]`;
+
         let path = [];
         let curr = el;
         while (curr && curr.nodeType === Node.ELEMENT_NODE && path.length < 4) {
             let selector = curr.tagName.toLowerCase();
+            if (curr.id) {
+                path.unshift(`#${escapeIdent(curr.id)}`);
+                break;
+            }
             if (curr.className && typeof curr.className === 'string') {
-                const classes = curr.className.trim().split(/\\s+/).filter(c => !c.includes(':') && !c.includes('['));
+                const classes = curr.className
+                    .trim()
+                    .split(/\\s+/)
+                    .filter(c => c && !c.includes(':') && !c.includes('[') && !c.includes('/'));
                 if (classes.length > 0) {
-                    selector += '.' + classes.slice(0, 2).join('.');
+                    selector += '.' + classes.slice(0, 2).map(escapeIdent).join('.');
+                }
+            }
+            if (curr.parentElement) {
+                const sameTagSiblings = Array.from(curr.parentElement.children).filter(
+                    sib => sib.tagName === curr.tagName
+                );
+                if (sameTagSiblings.length > 1) {
+                    const idx = sameTagSiblings.indexOf(curr) + 1;
+                    selector += `:nth-of-type(${idx})`;
                 }
             }
             path.unshift(selector);
@@ -109,9 +136,12 @@ class TargetFinder:
                     )
                 )
             return targets
-        except Exception:
-            # Fallback to basic button selector if evaluate fails
-            buttons = await page.query_selector_all("button, [role='button']")
+        except Exception as exc:
+            logger.debug("DOM evaluate scan failed, using fallback selector scan: %s", exc)
+            try:
+                buttons = await page.query_selector_all("button, [role='button']")
+            except Exception:
+                return []
             fallback_targets = []
             for idx, btn in enumerate(buttons[:10]):
                 try:
@@ -124,14 +154,18 @@ class TargetFinder:
                             is_submit=True,
                         )
                     )
-                except Exception:
-                    pass
+                except Exception as inner_exc:
+                    logger.debug("Fallback button inspection skipped: %s", inner_exc)
             return fallback_targets
 
     @staticmethod
     def filter_submit_targets(targets: List[TargetInfo]) -> List[TargetInfo]:
         """Filters targets that look like form submit, checkout, or transactional actions."""
-        return [t for t in targets if t.is_submit or t.tag_name in ("button", "input") and t.input_type == "submit"]
+        return [
+            t
+            for t in targets
+            if t.is_submit or (t.tag_name in ("button", "input") and t.input_type == "submit")
+        ]
 
     @staticmethod
     def filter_input_targets(targets: List[TargetInfo]) -> List[TargetInfo]:
@@ -146,4 +180,8 @@ class TargetFinder:
     @staticmethod
     def filter_buttons(targets: List[TargetInfo]) -> List[TargetInfo]:
         """Filters all clickable buttons and button-like controls."""
-        return [t for t in targets if t.tag_name == "button" or t.role == "button" or t.input_type in ("button", "submit")]
+        return [
+            t
+            for t in targets
+            if t.tag_name == "button" or t.role == "button" or t.input_type in ("button", "submit")
+        ]
