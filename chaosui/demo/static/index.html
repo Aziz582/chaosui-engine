@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ChaosUI Playground - Vulnerable Demo App</title>
+    <style>
+        :root {
+            --bg: #0b0f19;
+            --surface: #151d2f;
+            --border: #232f48;
+            --accent: #38bdf8;
+            --red: #f43f5e;
+            --yellow: #facc15;
+            --green: #4ade80;
+            --text: #f8fafc;
+            --muted: #94a3b8;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            background: var(--bg);
+            color: var(--text);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            padding: 2rem 1rem;
+            line-height: 1.5;
+        }
+        .container { max-width: 900px; margin: 0 auto; }
+        header { text-align: center; margin-bottom: 2.5rem; }
+        h1 { font-size: 2.2rem; font-weight: 800; color: var(--accent); margin-bottom: 0.5rem; }
+        p.subtitle { color: var(--muted); font-size: 1.1rem; }
+        
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 1.5rem; }
+        .card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 0.75rem;
+            padding: 1.5rem;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+        }
+        .card h2 { font-size: 1.25rem; font-weight: 700; margin-bottom: 0.5rem; display: flex; align-items: center; gap: 0.5rem; }
+        .card p { color: var(--muted); font-size: 0.9rem; margin-bottom: 1.25rem; }
+        
+        .btn {
+            background: var(--accent);
+            color: #0b0f19;
+            font-weight: 700;
+            border: none;
+            padding: 0.75rem 1.25rem;
+            border-radius: 0.5rem;
+            cursor: pointer;
+            font-size: 0.95rem;
+            transition: all 0.15s;
+        }
+        .btn:hover { opacity: 0.9; }
+        .btn-danger { background: var(--red); color: white; }
+        .btn-warning { background: var(--yellow); color: #0b0f19; }
+        
+        .log-box {
+            background: #060911;
+            border: 1px solid var(--border);
+            border-radius: 0.5rem;
+            padding: 0.75rem;
+            font-family: monospace;
+            font-size: 0.8rem;
+            color: var(--green);
+            min-height: 45px;
+            margin-top: 1rem;
+            overflow-x: auto;
+        }
+        .spinner {
+            display: inline-block;
+            width: 18px;
+            height: 18px;
+            border: 2px solid rgba(255,255,255,0.2);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            vertical-align: middle;
+            margin-right: 0.5rem;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>⚡ ChaosUI Playground</h1>
+            <p class="subtitle">Real-world Vulnerable Web App designed to test UI Chaos Scenarios</p>
+        </header>
+
+        <div class="grid">
+            <!-- Scenario 1: Double Submit Bug -->
+            <div class="card" id="card-checkout">
+                <div>
+                    <h2>🔁 Bug 1: Un-debounced Checkout</h2>
+                    <p>No client-side debouncing or button disabling. Frantic clicking sends multiple duplicate POST requests and charges the customer repeatedly!</p>
+                    <input type="text" id="order-email" value="customer@example.com" style="width: 100%; padding: 0.5rem; background: #0b0f19; border: 1px solid var(--border); color: white; margin-bottom: 0.75rem; border-radius: 0.35rem;">
+                </div>
+                <div>
+                    <button class="btn btn-warning" id="btn-pay" onclick="submitCheckout()">
+                        💳 Pay $150 & Place Order
+                    </button>
+                    <div class="log-box" id="log-checkout">Waiting for checkout action...</div>
+                </div>
+            </div>
+
+            <!-- Scenario 2: Main Thread UI Freeze -->
+            <div class="card" id="card-freeze">
+                <div>
+                    <h2>❄️ Bug 2: Blocking Computation (Freeze)</h2>
+                    <p>Performs heavy synchronous mathematical processing on the main browser thread, causing total browser unresponsiveness for 1.2 seconds.</p>
+                </div>
+                <div>
+                    <button class="btn btn-danger" id="btn-calc" onclick="heavySyncComputation()">
+                        ⚙️ Calculate Complex Tax Matrix
+                    </button>
+                    <div class="log-box" id="log-freeze">Main thread idle.</div>
+                </div>
+            </div>
+
+            <!-- Scenario 3: Uncaught Crash -->
+            <div class="card" id="card-crash">
+                <div>
+                    <h2>💥 Bug 3: Race Condition Crash</h2>
+                    <p>Rapid clicks mutate state before initial state is initialized, throwing an uncaught <code>TypeError: Cannot read properties of undefined</code>.</p>
+                </div>
+                <div>
+                    <button class="btn" id="btn-crash" onclick="triggerRaceCrash()">
+                        ⚡ Rapid Toggle State
+                    </button>
+                    <div class="log-box" id="log-crash">State ready.</div>
+                </div>
+            </div>
+
+            <!-- Scenario 4: Stuck Zombie Spinner -->
+            <div class="card" id="card-stuck">
+                <div>
+                    <h2>⏳ Bug 4: Perpetual Loading Spinner</h2>
+                    <p>Starts an infinite loading spinner when fetching data, but forgets to hide the spinner in the error catch block, locking the UI.</p>
+                </div>
+                <div>
+                    <button class="btn" id="btn-stuck" onclick="triggerPerpetualSpinner()">
+                        🔄 Load Analytics Feed
+                    </button>
+                    <div id="spinner-container" style="display:none; margin-top: 0.75rem; color: var(--accent);">
+                        <span class="spinner"></span> <span class="loading">Loading analytics feed forever...</span>
+                    </div>
+                    <div class="log-box" id="log-stuck">Analytics idle.</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let checkoutCount = 0;
+        async function submitCheckout() {
+            checkoutCount++;
+            document.getElementById('log-checkout').innerText = `[Req #${checkoutCount}] Dispatching POST /api/checkout...`;
+            
+            // INTENTIONAL BUG: No debounce, no disabled state!
+            try {
+                const res = await fetch('/api/checkout', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ item: 'Pro Subscription', amount: 150, email: document.getElementById('order-email').value })
+                });
+                const data = await res.json();
+                document.getElementById('log-checkout').innerText = `Order Placed: ${data.order_id} (Total: ${data.total_orders})`;
+            } catch (e) {
+                document.getElementById('log-checkout').innerText = 'Checkout error';
+            }
+        }
+
+        function heavySyncComputation() {
+            document.getElementById('log-freeze').innerText = 'Freezing main thread for 1200ms...';
+            // INTENTIONAL BUG: Synchronous blocking while loop (Blocks UI Main Thread)
+            const start = performance.now();
+            while (performance.now() - start < 1200) {
+                // busy wait
+            }
+            document.getElementById('log-freeze').innerText = 'Freeze finished! (1200ms main thread lock)';
+        }
+
+        let stateObj = null;
+        let isFetching = false;
+        function triggerRaceCrash() {
+            // INTENTIONAL BUG: Race condition leading to uncaught TypeError
+            if (!isFetching) {
+                isFetching = true;
+                setTimeout(() => { stateObj = { items: [1, 2, 3] }; isFetching = false; }, 200);
+            } else {
+                // Clicked again while fetching! Attempt to read uninitialized state
+                const len = stateObj.items.length; // Throws TypeError!
+                document.getElementById('log-crash').innerText = `Items: ${len}`;
+            }
+        }
+
+        function triggerPerpetualSpinner() {
+            // INTENTIONAL BUG: Shows spinner, fails to dismiss on error
+            document.getElementById('spinner-container').style.display = 'block';
+            document.getElementById('btn-stuck').disabled = true;
+            document.getElementById('log-stuck').innerText = 'Contacting server...';
+            setTimeout(() => {
+                document.getElementById('log-stuck').innerText = 'Network error! (Forgot to hide spinner)';
+                // Missing: document.getElementById('spinner-container').style.display = 'none';
+            }, 600);
+        }
+    </script>
+</body>
+</html>
